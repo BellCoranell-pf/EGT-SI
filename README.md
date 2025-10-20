@@ -12,7 +12,11 @@ ST-GNN.py: A spatio-temporal graph neural network based on GCN
 
 Enhanced-Graph-Transformer.py: An improved model using graph attention and Transformer architecture
 
-yearavetemp.csv: Raw meteorological dataset with station locations, elevation, and temperature records
+The meteorological data used in this study is processed from the Global Summary of the Day (GSOD) dataset, which is publicly available at:
+
+https://www.ncei.noaa.gov/data/global-summary-of-the-day/archive/
+
+The processed dataset (yearavetemp.csv) includes station coordinates (latitude and longitude), elevation, and annual mean temperature.
 
 Data Description
 
