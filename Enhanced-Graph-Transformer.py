@@ -1,468 +1,479 @@
-# -*- coding: utf-8 -*-
 import warnings
+
 warnings.filterwarnings("ignore")
 
+import time
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
-from sklearn.model_selection import train_test_split
+from torch.nn import TransformerEncoderLayer
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
-DATA_PATH = "yearavetemp.csv"
+DATA_PATH = "TAVE.csv"
+TARGET_COLUMNS = {'Tave': 'Tave'}
+
 DENSITIES = [0.05, 0.10, 0.15, 0.20, 0.25]
 SEEDS = list(range(42, 52))
-VAL_SIZE = 0.2
+HISTORY_YEARS = 10
+HISTORY_MODE = "after"
 
-EGT_HIDDEN = 32
-EGT_OUT = 8
-EGT_LAYERS = 2
-EGT_HEADS = 4
-EGT_DROPOUT = 0.1063
-EGT_LR = 9.855e-5
-EGT_WEIGHT_DECAY = 1.100e-6
-EGT_PATIENCE = 28
-EGT_EPOCHS = 200
+CONFIGS = [
+    {'name': 'cfg1',
+     'hidden': 32, 'out': 16, 'layers': 3, 'dropout': 0.0, 'weight_decay': 1e-5},
+    {'name': 'cfg2',
+     'hidden': 32, 'out': 16, 'layers': 2, 'dropout': 0.0, 'weight_decay': 1e-5},
+    {'name': 'cfg3',
+     'hidden': 16, 'out': 8, 'layers': 3, 'dropout': 0.0, 'weight_decay': 1e-5},
+]
+
+FIXED_PARAMS = {
+    'heads': 4,
+    'lr': 1e-3,
+    'patience': 20,
+    'epochs': 200,
+}
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {DEVICE}")
+
 
 def load_data():
     try:
-        df_raw = pd.read_csv(DATA_PATH, encoding="utf-8")
-    except:
+        df_raw = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+    except Exception:
         df_raw = pd.read_csv(DATA_PATH, encoding="gbk")
-    df_raw.rename(columns={
-        "年份": "year", "站点编号": "station", "经度": "lon",
-        "纬度": "lat", "高程": "elevation", "年均气温": "temp"
-    }, inplace=True)
-    df = df_raw[["year", "station", "lon", "lat", "elevation", "temp"]].dropna().copy()
+    df_raw.rename(columns={"station_id": "station", "longitude": "lon",
+                           "latitude": "lat"}, inplace=True)
+    df = df_raw[["year", "station", "lon", "lat", "elevation", "Tave"]].dropna().copy()
     df["year"] = df["year"].astype(int)
     df["station"] = df["station"].astype(str).str.strip()
-    df = df[(df["temp"] > -60) & (df["temp"] < 80)]
     return df
+
 
 df_full = load_data()
 years_all = sorted(df_full["year"].unique())
-station_year_counts = df_full.groupby("station")["year"].nunique()
-common_stations = station_year_counts[station_year_counts == len(years_all)].index.tolist()
-common_stations = sorted(common_stations)
-df = df_full[df_full["station"].isin(common_stations)].copy()
-station_info = df.groupby("station").first()[["lon", "lat", "elevation"]].to_dict("index")
-station_list_all = common_stations
-coords_all = {st: (station_info[st]["lon"], station_info[st]["lat"]) for st in station_list_all}
-elev_all = {st: station_info[st]["elevation"] for st in station_list_all}
+cnts = df_full.groupby("station")["year"].nunique()
+common = sorted(cnts[cnts == len(years_all)].index.tolist())
+df_raw = df_full[df_full["station"].isin(common)].copy()
+
+station_list_all = common
+n_stations = len(station_list_all)
+station_idx = {st: i for i, st in enumerate(station_list_all)}
+
+info = df_raw.groupby("station").first()[["lon", "lat", "elevation"]]
+lons_raw = info.loc[station_list_all, "lon"].values.astype(np.float32)
+lats_raw = info.loc[station_list_all, "lat"].values.astype(np.float32)
+elevs_raw = info.loc[station_list_all, "elevation"].values.astype(np.float32)
+
+lon_mu, lon_sd = lons_raw.mean(), lons_raw.std() + 1e-8
+lat_mu, lat_sd = lats_raw.mean(), lats_raw.std() + 1e-8
+elev_mu, elev_sd = elevs_raw.mean(), elevs_raw.std() + 1e-8
+lon_norm = ((lons_raw - lon_mu) / lon_sd).astype(np.float32)
+lat_norm = ((lats_raw - lat_mu) / lat_sd).astype(np.float32)
+elev_norm = ((elevs_raw - elev_mu) / elev_sd).astype(np.float32)
+COORDS_arr = np.stack([lons_raw, lats_raw], axis=1).astype(np.float32)
+
+
+def haversine_matrix(lon, lat):
+    R = 6371.0
+    lon_r, lat_r = np.radians(lon), np.radians(lat)
+    dlon = lon_r[None, :] - lon_r[:, None]
+    dlat = lat_r[None, :] - lat_r[:, None]
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat_r[:, None]) * np.cos(lat_r[None, :]) * np.sin(dlon / 2) ** 2
+    return (R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))).astype(np.float32)
+
+
+DIST_MATRIX = haversine_matrix(lons_raw, lats_raw)
+year_to_idx = {int(y): i for i, y in enumerate(years_all)}
+
 
 def split_stations_by_density(stations, density, seed):
-    np.random.seed(seed)
-    shuffled = np.random.permutation(stations)
-    n = len(shuffled)
+    rng = np.random.RandomState(seed)
+    sh = rng.permutation(stations)
+    n = len(sh)
     n_val = int(n * density)
     n_test = int(n * density)
     n_train = n - n_val - n_test
-    train_st = shuffled[:n_train]
-    val_st = shuffled[n_train:n_train+n_val]
-    test_st = shuffled[n_train+n_val:]
-    return list(train_st), list(val_st), list(test_st)
+    return (list(sh[:n_train]), list(sh[n_train:n_train + n_val]), list(sh[n_train + n_val:]))
 
-def compute_climatology(df, target_year, station_list):
-    clim = {}
-    for st in station_list:
-        sub = df[(df["station"] == st) & (df["year"] != target_year)]
-        if len(sub) > 0:
-            clim[st] = sub["temp"].mean()
-        else:
-            val = df[(df["station"] == st) & (df["year"] == target_year)]["temp"]
-            clim[st] = val.values[0] if len(val) > 0 else np.nan
-    global_clim = np.nanmean(list(clim.values()))
-    for st in station_list:
-        if np.isnan(clim[st]):
-            clim[st] = global_clim
-    return clim
 
-def haversine(lon1, lat1, lon2, lat2):
-    R = 6371.0
-    lon1_rad = np.radians(lon1); lat1_rad = np.radians(lat1)
-    lon2_rad = np.radians(lon2); lat2_rad = np.radians(lat2)
-    dlon = lon2_rad - lon1_rad; dlat = lat2_rad - lat1_rad
-    a = np.sin(dlat/2)**2 + np.cos(lat1_rad)*np.cos(lat2_rad)*np.sin(dlon/2)**2
-    c = 2*np.arctan2(np.sqrt(a), np.sqrt(1-a))
-    return R*c
+def get_history_years(yr_test, all_years, n_years, mode="after"):
+    all_years = sorted(int(y) for y in all_years)
+    if mode == "after":
+        cand = [y for y in all_years if y > yr_test]
+        hist = cand[:n_years]
+        if len(hist) < n_years:
+            past = [y for y in all_years if y < yr_test][::-1]
+            hist = hist + past[:n_years - len(hist)]
+    else:
+        cand = [y for y in all_years if y < yr_test][::-1]
+        hist = cand[:n_years]
+        if len(hist) < n_years:
+            fut = [y for y in all_years if y > yr_test]
+            hist = hist + fut[:n_years - len(hist)]
+    return sorted(hist)
 
-def idw_prior(target_station, obs_set, df_test_year, coords, power=2):
-    target_lon, target_lat = coords[target_station]
-    weights = []
-    temps = []
-    for st in obs_set:
-        lon, lat = coords[st]
-        row = df_test_year[df_test_year["station"] == st]
-        if row.empty:
-            continue
-        temp = row["temp"].values[0]
-        d = haversine(target_lon, target_lat, lon, lat)
-        if d < 1e-6:
-            return temp
-        weights.append(1.0 / (d ** power))
-        temps.append(temp)
-    if not weights:
-        return np.mean(temps) if temps else 0.0
-    weights = np.array(weights)
-    temps = np.array(temps)
-    return np.sum(weights * temps) / np.sum(weights)
 
-all_clim_vals = np.array([compute_climatology(df, years_all[0], station_list_all)[st] for st in station_list_all])
-clim_mean_global = np.mean(all_clim_vals)
-clim_std_global = np.std(all_clim_vals) + 1e-8
+def compute_clim_idw(target_idx, context_idx, context_clim):
+    if len(context_idx) == 0:
+        return float(np.nanmean(context_clim)) if len(context_clim) else 0.0
+    d = DIST_MATRIX[target_idx, context_idx]
+    w = 1.0 / (d ** 2 + 1e-12)
+    mask = ~np.isnan(context_clim)
+    return float((w[mask] * context_clim[mask]).sum() / w[mask].sum()) if mask.any() else 0.0
+
 
 class EncoderWithAttn(nn.Module):
-    def __init__(self, in_channels, hidden_dim=32, out_channels=8,
-                 num_layers=2, nhead=4, dropout=0.1,
-                 use_year=True, use_coord=True, year_to_idx=None,
-                 use_attn=True):
+    def __init__(self, in_channels, hidden_dim, out_channels, num_layers, nhead,
+                 dropout, year_to_idx):
         super().__init__()
-        self.use_year = use_year
-        self.use_coord = use_coord
         self.year_to_idx = year_to_idx
         self.input_proj = nn.Linear(in_channels, hidden_dim)
-
-        if use_year:
-            self.year_embedding = nn.Embedding(len(year_to_idx), hidden_dim)
-        if use_coord:
-            self.coord_proj = nn.Linear(2, hidden_dim)
-
-        self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            layer = TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=nhead,
-                dim_feedforward=hidden_dim * 4,
-                dropout=dropout,
-                batch_first=True
-            )
-            self.layers.append(layer)
-
+        self.year_embedding = nn.Embedding(len(year_to_idx), hidden_dim)
+        self.coord_proj = nn.Linear(2, hidden_dim)
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead,
+                                    dim_feedforward=hidden_dim * 4,
+                                    dropout=dropout, batch_first=True)
+            for _ in range(num_layers)
+        ])
         self.output_proj = nn.Linear(hidden_dim, out_channels)
 
     def forward(self, x, year, coords):
         h = self.input_proj(x)
-        if self.use_year:
-            yidx = self.year_to_idx.get(int(year), 0)
-            yemb = self.year_embedding(torch.tensor([yidx], device=x.device))
-            h = h + yemb.expand(h.size(0), -1)
-        if self.use_coord:
-            h = h + self.coord_proj(coords)
+        yidx = self.year_to_idx.get(int(year), 0)
+        yemb = self.year_embedding(torch.tensor([yidx], dtype=torch.long, device=x.device))
+        h = h + yemb.expand(h.size(0), -1) + self.coord_proj(coords)
         h = h.unsqueeze(0)
         for layer in self.layers:
             h = layer(h)
-        h = h.squeeze(0)
-        return self.output_proj(h)
+        return self.output_proj(h.squeeze(0))
+
 
 class TempPredictor(nn.Module):
-    def __init__(self, node_dim=8, hidden_dim=16, dropout=0.1):
+    def __init__(self, node_dim, hidden_dim=16, dropout=0.1):
         super().__init__()
         self.fc1 = nn.Linear(node_dim, hidden_dim)
         self.relu = nn.ReLU()
         self.drop = nn.Dropout(dropout)
         self.fc2 = nn.Linear(hidden_dim, 1)
-    def forward(self, h_node):
-        if h_node.dim() == 1:
-            h_node = h_node.unsqueeze(0)
-        z = self.fc1(h_node); z = self.relu(z); z = self.drop(z); z = self.fc2(z)
-        return z.squeeze(-1)
 
-def build_features_idw(year, target_set, station_list, COORDS, ELEV,
-                       year_station_temp, GLOBAL_TRAIN_MEAN, get_station_prior,
-                       clim_dict, df_test_year, obs_set,
-                       include_lon=True, include_lat=True, include_elev=True):
-    lons = np.array([COORDS[st][0] for st in station_list])
-    lats = np.array([COORDS[st][1] for st in station_list])
-    elevs = np.array([ELEV[st] for st in station_list])
-    lon_mean, lon_std = lons.mean(), lons.std() + 1e-8
-    lat_mean, lat_std = lats.mean(), lats.std() + 1e-8
-    elev_mean, elev_std = elevs.mean(), elevs.std() + 1e-8
+    def forward(self, h):
+        if h.dim() == 1:
+            h = h.unsqueeze(0)
+        return self.fc2(self.drop(self.relu(self.fc1(h)))).squeeze(-1)
 
-    feats = []
-    coords = []
-    target_indices = []
-    for idx, st in enumerate(station_list):
-        lon, lat = COORDS[st]
-        elev = ELEV[st]
-        is_target = 1.0 if st in target_set else 0.0
 
-        lon_norm = (lon - lon_mean) / lon_std
-        lat_norm = (lat - lat_mean) / lat_std
-        elev_norm = (elev - elev_mean) / elev_std
-        clim_norm = (clim_dict.get(st, clim_mean_global) - clim_mean_global) / clim_std_global
-
-        if st in target_set:
-            idw_temp = idw_prior(st, obs_set, df_test_year, COORDS)
-            temp_val = idw_temp
-            has_obs = 0.0
-        else:
-            key = (year, st)
-            temp_val = year_station_temp.get(key, clim_dict.get(st, GLOBAL_TRAIN_MEAN))
-            has_obs = 1.0
-
-        temp_norm = (temp_val - GLOBAL_TRAIN_MEAN) / 20.0
-        feat = [temp_norm]
-        if include_lon:
-            feat.append(lon_norm)
-        if include_lat:
-            feat.append(lat_norm)
-        if include_elev:
-            feat.append(elev_norm)
-        feat += [clim_norm, has_obs, is_target]
-        feats.append(feat)
-        coords.append([lon, lat])
-        if is_target == 1.0:
-            target_indices.append(idx)
-
-    x = torch.tensor(feats, dtype=torch.float32)
-    c = torch.tensor(coords, dtype=torch.float32)
-    return x, c, target_indices
-
-def run_single_experiment(seed, density):
+def prepare_seed(seed, density, df, year_temp_array, history_years):
     np.random.seed(seed)
     torch.manual_seed(seed)
-
     yr_test = int(np.random.choice(years_all))
-    df_test_year = df[df["year"] == yr_test].copy()
-    df_other = df[df["year"] != yr_test].copy()
-    train_df, val_df = train_test_split(df_other, test_size=VAL_SIZE, random_state=seed)
+    hist_years = get_history_years(yr_test, years_all, history_years, HISTORY_MODE)
 
     train_st, val_st, test_st = split_stations_by_density(station_list_all, density, seed)
-    year_stations = df_test_year["station"].tolist()
-    obs_set = [st for st in train_st if st in year_stations]
-    target_set = [st for st in test_st if st in year_stations]
-    if len(obs_set) < 3:
-        print(f"Seed {seed} Density {density}: Too few observations ({len(obs_set)}), skipping.")
-        return None
+    train_idx = np.array([station_idx[s] for s in train_st], dtype=np.int64)
+    val_idx = np.array([station_idx[s] for s in val_st], dtype=np.int64)
+    test_idx = np.array([station_idx[s] for s in test_st], dtype=np.int64)
 
-    station_list = sorted(df["station"].unique())
-    station_info_full = df.groupby("station").first()[["lon", "lat", "elevation"]].to_dict("index")
-    COORDS_full = {st: (station_info_full[st]["lon"], station_info_full[st]["lat"]) for st in station_list}
-    ELEV_full = {st: station_info_full[st]["elevation"] for st in station_list}
+    df_h = df[df["year"].isin(hist_years)]
+    train_df = df_h[df_h["station"].isin(train_st)].copy()
 
-    GLOBAL_TRAIN_MEAN = float(train_df["temp"].mean())
-    STATION_CLIMATE_TRAIN = train_df.groupby("station")["temp"].mean().to_dict()
-    def get_station_prior(st):
-        return STATION_CLIMATE_TRAIN.get(st, GLOBAL_TRAIN_MEAN)
+    train_clim = np.full(n_stations, np.nan, dtype=np.float32)
+    for st, v in train_df.groupby("station")["temp"].mean().items():
+        train_clim[station_idx[st]] = np.float32(v)
+    valid = train_clim[train_idx]
+    valid = valid[~np.isnan(valid)]
+    clim_mean = float(valid.mean()) if len(valid) else 0.0
+    clim_std = float(valid.std() + 1e-8) if len(valid) else 1.0
+    global_mean = float(train_df["temp"].mean())
 
-    clim_dict = compute_climatology(df, yr_test, station_list)
-    year_station_temp = {}
-    for _, row in pd.concat([train_df, val_df]).iterrows():
-        year_station_temp[(int(row["year"]), str(row["station"]))] = float(row["temp"])
+    clim_arr = train_clim.copy()
+    non_train_idx = np.setdiff1d(np.arange(n_stations), train_idx)
+    if len(non_train_idx) > 0 and len(train_idx) > 0:
+        d_nt = DIST_MATRIX[non_train_idx][:, train_idx]
+        w_nt = 1.0 / (d_nt ** 2 + 1e-12)
+        mask = ~np.isnan(train_clim[train_idx])
+        if mask.any():
+            vals = train_clim[train_idx][mask]
+            clim_arr[non_train_idx] = (w_nt[:, mask] @ vals) / w_nt[:, mask].sum(axis=1)
+        else:
+            clim_arr[non_train_idx] = global_mean
+    clim_arr = np.where(np.isnan(clim_arr), global_mean, clim_arr).astype(np.float32)
 
-    years_unique = sorted(df["year"].unique())
-    year_to_idx = {y: i for i, y in enumerate(years_unique)}
-    true_temps = {str(row["station"]): float(row["temp"]) for _, row in df_test_year.iterrows()}
+    clim_except = np.zeros(n_stations, dtype=np.float32)
+    for i in train_idx:
+        ctx = train_idx[train_idx != i]
+        clim_except[int(i)] = compute_clim_idw(i, ctx, train_clim[ctx])
 
-    include_lon = True
-    include_lat = True
-    include_elev = True
-    use_year = True
-    use_coord = True
+    X_tpl = np.zeros((n_stations, 7), dtype=np.float32)
+    X_tpl[:, 1] = lon_norm
+    X_tpl[:, 2] = lat_norm
+    X_tpl[:, 3] = elev_norm
+    X_tpl[:, 4] = (clim_arr - clim_mean) / clim_std
+    X_tpl[:, 5] = 0.0
+    X_tpl[:, 6] = 0.0
+    X_tpl[train_idx, 5] = 1.0
 
-    dummy_x, _, _ = build_features_idw(
-        yr_test, target_set, station_list, COORDS_full, ELEV_full,
-        year_station_temp, GLOBAL_TRAIN_MEAN, get_station_prior,
-        clim_dict, df_test_year, obs_set,
-        include_lon=include_lon, include_lat=include_lat, include_elev=include_elev
-    )
-    in_ch = dummy_x.shape[1]
+    D_tt = DIST_MATRIX[np.ix_(train_idx, train_idx)]
+    W_tt = 1.0 / (D_tt ** 2 + 1e-12)
+    np.fill_diagonal(W_tt, 0.0)
+    idw_train = {}
+    for yr in hist_years:
+        tt = year_temp_array[yr][train_idx].astype(np.float32)
+        m = ~np.isnan(tt)
+        W_m = W_tt * m[None, :]
+        dn = W_m.sum(axis=1)
+        num = W_m @ np.where(m, tt, 0.0).astype(np.float32)
+        fb = float(np.nanmean(tt)) if m.any() else 0.0
+        idw_train[yr] = np.where(dn > 1e-12, num / (dn + 1e-12), fb).astype(np.float32)
 
-    encoder = EncoderWithAttn(
-        in_channels=in_ch,
-        hidden_dim=EGT_HIDDEN,
-        out_channels=EGT_OUT,
-        num_layers=EGT_LAYERS,
-        nhead=EGT_HEADS,
-        dropout=EGT_DROPOUT,
-        use_year=use_year,
-        use_coord=use_coord,
-        year_to_idx=year_to_idx
-    ).to(DEVICE)
+    def _idw(q_idx, yr):
+        tt = year_temp_array[yr][train_idx].astype(np.float32)
+        m = ~np.isnan(tt)
+        if not m.any():
+            return np.full(len(q_idx), np.nanmean(tt) if len(tt) else 0.0, dtype=np.float32)
+        D_q = DIST_MATRIX[np.ix_(q_idx, train_idx)]
+        W_q = 1.0 / (D_q ** 2 + 1e-12) * m[None, :]
+        dn = W_q.sum(axis=1)
+        num = W_q @ np.where(m, tt, 0.0).astype(np.float32)
+        fb = float(np.nanmean(tt))
+        return np.where(dn > 1e-12, num / (dn + 1e-12), fb).astype(np.float32)
 
-    predictor = TempPredictor(node_dim=EGT_OUT, hidden_dim=16, dropout=EGT_DROPOUT).to(DEVICE)
+    idw_val = {yr: _idw(val_idx, yr) for yr in hist_years}
+    idw_test = _idw(test_idx, yr_test)
+    y_val = {yr: year_temp_array[yr][val_idx].astype(np.float32) for yr in hist_years}
+    y_test = year_temp_array[yr_test][test_idx].astype(np.float32)
 
-    optimizer = optim.Adam(list(encoder.parameters()) + list(predictor.parameters()),
-                           lr=EGT_LR, weight_decay=EGT_WEIGHT_DECAY)
-    criterion = nn.MSELoss()
+    return dict(seed=seed, yr_test=yr_test, hist_years=hist_years,
+                train_idx=train_idx, val_idx=val_idx, test_idx=test_idx,
+                X_tpl=X_tpl, clim_except=clim_except[train_idx],
+                clim_arr_val=clim_arr[val_idx], clim_arr_test=clim_arr[test_idx],
+                clim_mean=clim_mean, clim_std=clim_std, global_mean=global_mean,
+                idw_train=idw_train, idw_val=idw_val, idw_test=idw_test,
+                y_val=y_val, y_test=y_test, year_temp_array=year_temp_array)
 
-    train_samples = [(row["station"], row["year"], row["temp"]) for _, row in train_df.iterrows()]
-    val_samples = [(row["station"], row["year"], row["temp"]) for _, row in val_df.iterrows()]
 
-    best_val_rmse = float("inf")
+def train_and_eval(prep, params):
+    seed = prep['seed']
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    tr, va, te = prep['train_idx'], prep['val_idx'], prep['test_idx']
+    X_tpl = prep['X_tpl']
+
+    enc = EncoderWithAttn(7, params['hidden'], params['out'],
+                          params['layers'], params['heads'], params['dropout'],
+                          year_to_idx=year_to_idx).to(DEVICE)
+    prd = TempPredictor(params['out'], 16, params['dropout']).to(DEVICE)
+    opt = optim.Adam(list(enc.parameters()) + list(prd.parameters()),
+                     lr=params['lr'], weight_decay=params['weight_decay'])
+    crit = nn.MSELoss()
+    c_t = torch.tensor(COORDS_arr, dtype=torch.float32, device=DEVICE)
+
+    X_tr_by_yr, y_tr_by_yr = {}, {}
+    for yr in prep['hist_years']:
+        X = X_tpl.copy()
+        X[tr, 0] = (prep['idw_train'][yr] - prep['global_mean']) / 20.0
+        X[tr, 4] = (prep['clim_except'] - prep['clim_mean']) / prep['clim_std']
+        X[tr, 5] = 0.0
+        X[tr, 6] = 1.0
+        X_tr_by_yr[yr] = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+        y_tr_by_yr[yr] = torch.tensor(prep['year_temp_array'][yr][tr], dtype=torch.float32, device=DEVICE)
+
+    X_va_by_yr = {}
+    for yr in prep['hist_years']:
+        X = X_tpl.copy()
+        X[va, 0] = (prep['idw_val'][yr] - prep['global_mean']) / 20.0
+        X[va, 4] = (prep['clim_arr_val'] - prep['clim_mean']) / prep['clim_std']
+        X[va, 5] = 0.0
+        X[va, 6] = 1.0
+        X_va_by_yr[yr] = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+
+    X_te = X_tpl.copy()
+    X_te[te, 0] = (prep['idw_test'] - prep['global_mean']) / 20.0
+    X_te[te, 4] = (prep['clim_arr_test'] - prep['clim_mean']) / prep['clim_std']
+    X_te[te, 5] = 0.0
+    X_te[te, 6] = 1.0
+    X_te_t = torch.tensor(X_te, dtype=torch.float32, device=DEVICE)
+
+    best_v = float("inf")
     wait = 0
-    best_encoder_sd = None
-    best_predictor_sd = None
+    best_ep = 0
+    best_enc = best_prd = None
 
-    for epoch in range(1, EGT_EPOCHS+1):
-        encoder.train()
-        predictor.train()
-        total_loss = 0.0
-        n = 0
-        for st, yr, y_true in train_samples:
-            target_set_single = {st}
-            x, c, target_indices = build_features_idw(
-                yr, target_set_single, station_list, COORDS_full, ELEV_full,
-                year_station_temp, GLOBAL_TRAIN_MEAN, get_station_prior,
-                clim_dict, df_test_year, obs_set,
-                include_lon=include_lon, include_lat=include_lat, include_elev=include_elev
-            )
-            x, c = x.to(DEVICE), c.to(DEVICE)
-            h_all = encoder(x, yr, c)
-            h_target = h_all[target_indices[0]:target_indices[0]+1]
-            pred = predictor(h_target)
-            loss = criterion(pred, torch.tensor([y_true], device=DEVICE))
-            optimizer.zero_grad()
+    for epoch in range(1, params['epochs'] + 1):
+        enc.train()
+        prd.train()
+        for yr in prep['hist_years']:
+            h = enc(X_tr_by_yr[yr], yr, c_t)
+            p = prd(h[tr])
+            yt = y_tr_by_yr[yr]
+            m = ~torch.isnan(yt)
+            if m.sum() == 0: continue
+            loss = crit(p[m], yt[m])
+            opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
-            optimizer.step()
-            total_loss += loss.item()
-            n += 1
+            torch.nn.utils.clip_grad_norm_(enc.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(prd.parameters(), 1.0)
+            opt.step()
 
-        encoder.eval()
-        predictor.eval()
-        preds_val, trues_val = [], []
+        if epoch % 2 != 0 and epoch != params['epochs']: continue
+
+        enc.eval()
+        prd.eval()
+        pv, tv = [], []
         with torch.no_grad():
-            for st, yr, y_true in val_samples:
-                target_set_single = {st}
-                x, c, target_indices = build_features_idw(
-                    yr, target_set_single, station_list, COORDS_full, ELEV_full,
-                    year_station_temp, GLOBAL_TRAIN_MEAN, get_station_prior,
-                    clim_dict, df_test_year, obs_set,
-                    include_lon=include_lon, include_lat=include_lat, include_elev=include_elev
-                )
-                x, c = x.to(DEVICE), c.to(DEVICE)
-                h_all = encoder(x, yr, c)
-                h_target = h_all[target_indices[0]:target_indices[0]+1]
-                pred = predictor(h_target)
-                preds_val.append(pred.item())
-                trues_val.append(y_true)
-        rmse_val = np.sqrt(mean_squared_error(trues_val, preds_val))
-
-        if rmse_val < best_val_rmse:
-            best_val_rmse = rmse_val
+            for yr in prep['hist_years']:
+                h = enc(X_va_by_yr[yr], yr, c_t)
+                pp = prd(h[va]).cpu().numpy()
+                yt = prep['y_val'][yr]
+                m = ~np.isnan(yt)
+                if m.any():
+                    pv.extend(pp[m].tolist())
+                    tv.extend(yt[m].tolist())
+        if not pv: continue
+        rv = float(np.sqrt(mean_squared_error(tv, pv)))
+        if rv < best_v:
+            best_v = rv
             wait = 0
-            best_encoder_sd = {k: v.cpu().clone() for k, v in encoder.state_dict().items()}
-            best_predictor_sd = {k: v.cpu().clone() for k, v in predictor.state_dict().items()}
+            best_ep = epoch
+            best_enc = {k: v.detach().cpu().clone() for k, v in enc.state_dict().items()}
+            best_prd = {k: v.detach().cpu().clone() for k, v in prd.state_dict().items()}
         else:
             wait += 1
-            if wait >= EGT_PATIENCE:
-                break
+            if wait >= params['patience']: break
 
-    encoder.load_state_dict(best_encoder_sd)
-    predictor.load_state_dict(best_predictor_sd)
-    encoder.eval()
-    predictor.eval()
-    preds_test, trues_test = [], []
+    if best_enc is None:
+        best_enc = {k: v.detach().cpu().clone() for k, v in enc.state_dict().items()}
+        best_prd = {k: v.detach().cpu().clone() for k, v in prd.state_dict().items()}
+
+    enc.load_state_dict(best_enc)
+    prd.load_state_dict(best_prd)
+    enc.eval()
+    prd.eval()
+
     with torch.no_grad():
-        for st in target_set:
-            yr = yr_test
-            target_set_single = {st}
-            x, c, target_indices = build_features_idw(
-                yr, target_set_single, station_list, COORDS_full, ELEV_full,
-                year_station_temp, GLOBAL_TRAIN_MEAN, get_station_prior,
-                clim_dict, df_test_year, obs_set,
-                include_lon=include_lon, include_lat=include_lat, include_elev=include_elev
-            )
-            x, c = x.to(DEVICE), c.to(DEVICE)
-            h_all = encoder(x, yr, c)
-            h_target = h_all[target_indices[0]:target_indices[0]+1]
-            pred = predictor(h_target)
-            preds_test.append(pred.item())
-            trues_test.append(true_temps[st])
+        h = enc(X_te_t, prep['yr_test'], c_t)
+        preds_all = prd(h[te]).cpu().numpy()
+    yt_all = prep['y_test']
+    m = ~np.isnan(yt_all)
+    preds = preds_all[m]
+    yt = yt_all[m]
 
-    preds_c = (np.array(preds_test) - 32.0) * 5.0 / 9.0
-    trues_c = (np.array(trues_test) - 32.0) * 5.0 / 9.0
-    rmse = np.sqrt(mean_squared_error(trues_c, preds_c))
-    mae = mean_absolute_error(trues_c, preds_c)
-    r2 = r2_score(trues_c, preds_c)
-    return rmse, mae, r2, preds_c, trues_c
+    test_rmse = float(np.sqrt(mean_squared_error(yt, preds)))
+    test_mae = float(mean_absolute_error(yt, preds))
+    test_r2 = float(r2_score(yt, preds)) if len(yt) > 1 else float('nan')
 
-results = []
-all_preds = {}
-all_trues = {}
+    return best_v, test_rmse, test_mae, test_r2, best_ep
 
-for density in DENSITIES:
-    print(f"\n===== Density {density*100:.0f}% =====")
-    rmse_list, mae_list, r2_list = [], [], []
-    preds_all, trues_all = [], []
+
+if __name__ == "__main__":
+    t_start = time.time()
+
+    target_name, target_col = list(TARGET_COLUMNS.items())[0]
+
+    df = df_raw.copy()
+    df["temp"] = df[target_col].astype(np.float32)
+    df = df[(df["temp"] > -40) & (df["temp"] < 50)]
+
+    yta = {}
+    for yr in years_all:
+        yr = int(yr)
+        arr = np.full(n_stations, np.nan, dtype=np.float32)
+        sub = df[df["year"] == yr]
+        for st, t in zip(sub["station"].values, sub["temp"].values):
+            arr[station_idx[st]] = np.float32(t)
+        yta[yr] = arr
+
+    print("Precomputing data splits for 10 seeds...")
+    prep_cache = {}
     for seed in SEEDS:
-        res = run_single_experiment(seed, density)
-        if res is None:
-            continue
-        rmse, mae, r2, preds, trues = res
-        rmse_list.append(rmse)
-        mae_list.append(mae)
-        r2_list.append(r2)
-        preds_all.extend(preds.tolist())
-        trues_all.extend(trues.tolist())
-        print(f"  Seed {seed}: RMSE={rmse:.4f}, MAE={mae:.4f}, R2={r2:.4f}")
+        for density in DENSITIES:
+            prep_cache[(seed, density)] = prepare_seed(seed, density, df, yta, HISTORY_YEARS)
+    print(f"Precomputation done, time: {time.time() - t_start:.1f}s")
 
-    if len(rmse_list) > 0:
-        overall_rmse = np.sqrt(mean_squared_error(trues_all, preds_all))
-        overall_mae = mean_absolute_error(trues_all, preds_all)
-        overall_r2 = r2_score(trues_all, preds_all)
-        results.append({
-            'Density': f"{density*100:.0f}%",
-            'RMSE_mean': np.mean(rmse_list),
-            'RMSE_std': np.std(rmse_list),
-            'MAE_mean': np.mean(mae_list),
-            'MAE_std': np.std(mae_list),
-            'R2_mean': np.mean(r2_list),
-            'R2_std': np.std(r2_list),
-            'Overall_RMSE': overall_rmse,
-            'Overall_MAE': overall_mae,
-            'Overall_R2': overall_r2,
-            'preds': preds_all,
-            'trues': trues_all
+    comparison_rows = []
+
+    for cfg in CONFIGS:
+        cfg_name = cfg['name']
+        print(f"\n{'=' * 70}")
+        print(f"Running {target_name} - {cfg_name}: hidden={cfg['hidden']}, "
+              f"out={cfg['out']}, layers={cfg['layers']}")
+        print(f"{'=' * 70}")
+
+        full_params = {**FIXED_PARAMS, **cfg}
+        per_seed_rows = []
+        t_cfg = time.time()
+
+        for density in DENSITIES:
+            print(f"  Density {density * 100:.0f}%")
+            for seed in SEEDS:
+                prep = prep_cache[(seed, density)]
+                val_rmse, test_rmse, test_mae, test_r2, best_ep = train_and_eval(prep, full_params)
+
+                per_seed_rows.append({
+                    'Target': target_name, 'Config': cfg_name,
+                    'Density': density, 'Seed': seed,
+                    'val_rmse': val_rmse, 'test_rmse': test_rmse,
+                    'test_mae': test_mae, 'test_r2': test_r2,
+                    'best_epoch': best_ep
+                })
+
+        df_ps = pd.DataFrame(per_seed_rows)
+        df_ps.to_csv(f"egtsi_Tave_{cfg_name}_per_seed.csv", index=False, encoding="utf-8-sig")
+
+        summary_rows = []
+        for density in DENSITIES:
+            sub = df_ps[df_ps['Density'] == density]
+            summary_rows.append({
+                'Density': f"{density * 100:.0f}%",
+                'RMSE_mean': sub['test_rmse'].mean(),
+                'RMSE_std': sub['test_rmse'].std(),
+                'MAE_mean': sub['test_mae'].mean(),
+                'MAE_std': sub['test_mae'].std(),
+                'R2_mean': sub['test_r2'].mean(),
+                'R2_std': sub['test_r2'].std(),
+            })
+
+        total_rmse = df_ps['test_rmse'].mean()
+        total_mae = df_ps['test_mae'].mean()
+        total_r2 = df_ps['test_r2'].mean()
+
+        summary_rows.append({
+            'Density': 'Total',
+            'RMSE_mean': total_rmse,
+            'RMSE_std': np.nan,
+            'MAE_mean': total_mae,
+            'MAE_std': np.nan,
+            'R2_mean': total_r2,
+            'R2_std': np.nan,
         })
-    else:
-        results.append({
-            'Density': f"{density*100:.0f}%",
-            'RMSE_mean': np.nan, 'RMSE_std': np.nan,
-            'MAE_mean': np.nan, 'MAE_std': np.nan,
-            'R2_mean': np.nan, 'R2_std': np.nan,
-            'Overall_RMSE': np.nan, 'Overall_MAE': np.nan, 'Overall_R2': np.nan,
-            'preds': [], 'trues': []
+
+        df_sum = pd.DataFrame(summary_rows).round(4)
+        df_sum.to_csv(f"egtsi_Tave_{cfg_name}_results.csv", index=False, encoding="utf-8-sig")
+
+        print(f"\n  {cfg_name} Summary:")
+        print(df_sum.to_string(index=False))
+        print(f"  Time: {(time.time() - t_cfg) / 60:.1f} min")
+
+        comparison_rows.append({
+            'Config': cfg_name,
+            'Hidden': cfg['hidden'],
+            'Out': cfg['out'],
+            'Layers': cfg['layers'],
+            'Dropout': cfg['dropout'],
+            'WD': cfg['weight_decay'],
+            'Total_RMSE': total_rmse,
+            'Total_MAE': total_mae,
+            'Total_R2': total_r2,
         })
 
-all_preds_total = []
-all_trues_total = []
-for res in results:
-    all_preds_total.extend(res['preds'])
-    all_trues_total.extend(res['trues'])
+    df_cmp = pd.DataFrame(comparison_rows).sort_values('Total_RMSE').round(4)
+    df_cmp.to_csv("tave_configs_comparison.csv", index=False, encoding="utf-8-sig")
 
-total_rmse = np.sqrt(mean_squared_error(all_trues_total, all_preds_total))
-total_mae = mean_absolute_error(all_trues_total, all_preds_total)
-total_r2 = r2_score(all_trues_total, all_preds_total)
-
-summary_df = pd.DataFrame(results)
-summary_df = summary_df[['Density', 'RMSE_mean', 'RMSE_std', 'MAE_mean', 'MAE_std', 'R2_mean', 'R2_std']]
-summary_df.columns = ['Density', 'RMSE', 'RMSE_std', 'MAE', 'MAE_std', 'R²', 'R²_std']
-summary_df = summary_df.round(4)
-
-total_row = pd.DataFrame({
-    'Density': ['Total'],
-    'RMSE': [total_rmse],
-    'RMSE_std': [np.nan],
-    'MAE': [total_mae],
-    'MAE_std': [np.nan],
-    'R²': [total_r2],
-    'R²_std': [np.nan]
-})
-summary_df = pd.concat([summary_df, total_row], ignore_index=True)
-
-print("\n" + "="*80)
-print("Full Model Performance Across Densities")
-print("="*80)
-print(summary_df.to_string(index=False))
-print("\nOverall (all densities combined): RMSE = {:.4f}°C, MAE = {:.4f}°C, R² = {:.4f}".format(total_rmse, total_mae, total_r2))
-
-summary_df.to_csv("full_model_multi_density_results.csv", index=False)
-print("\nResults saved to full_model_multi_density_results.csv")
+    print(f"\n\n{'=' * 80}")
+    print("Final comparison of 3 TAVE configurations (sorted by Total RMSE ascending)")
+    print(f"{'=' * 80}")
+    print(df_cmp.to_string(index=False))
+    print(f"\nTotal time: {(time.time() - t_start) / 60:.1f} minutes")
+    print("Saved: tave_configs_comparison.csv")
